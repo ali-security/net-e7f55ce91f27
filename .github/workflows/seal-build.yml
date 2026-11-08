@@ -1,0 +1,159 @@
+# Build-and-test workflow for golang.org/x/net on the ali-security fork.
+# Upstream (go.googlesource.com/net) has no GitHub Actions CI; it is tested by
+# the Go project's own builders with `go test ./...` on the supported Go
+# releases. This workflow mirrors that: build + full test suite on Go 1.24
+# (the go.mod `go` directive) and Go 1.25 (the other supported release at the
+# v0.45.0 release date), and produces the proxy-format module zip.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+# Dependencies resolve through the default proxy, verified against the
+# release's own go.sum; the toolchain is exactly the one setup-go installed.
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  build-test:
+    name: build-test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24.x", "1.25.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Produce module zip
+        if: matrix.go == '1.24.x'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Copy the module tree and drop this (Seal-authored) workflow so it
+          # never ships in the module zip; upstream has no .github of its own.
+          MODSRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$MODSRC"
+          cp -a . "$MODSRC/"
+          rm -f "$MODSRC/.github/workflows/seal-build.yml"
+          if [ -z "$(ls -A "$MODSRC/.github/workflows")" ]; then rmdir "$MODSRC/.github/workflows"; fi
+          if [ -z "$(ls -A "$MODSRC/.github")" ]; then rmdir "$MODSRC/.github"; fi
+          HELPER="$RUNNER_TEMP/zipper"
+          mkdir -p "$HELPER" "$RUNNER_TEMP/build_output"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+          )
+
+          func main() {
+            if len(os.Args) != 5 {
+              log.Fatal("usage: zipper <module-path> <version> <source-dir> <output-zip>")
+            }
+            m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+            f, err := os.Create(os.Args[4])
+            if err != nil {
+              log.Fatal(err)
+            }
+            defer f.Close()
+            if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+              log.Fatal(err)
+            }
+            log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . golang.org/x/net v0.45.0 "$MODSRC" "$RUNNER_TEMP/build_output/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.45.0.zip" | tail -1
+
+      - name: Build
+        shell: bash
+        run: |
+          go version
+          go build -v ./...
+
+      # The ipv4/ipv6/icmp tests need IPv6 on loopback, a multicast-capable
+      # interface and unprivileged ICMP sockets; the runner ships with none of
+      # them, so enable them the way a developer machine has them.
+      - name: Configure network for tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          # lo is left without the MULTICAST flag: with it set, the hosted
+          # runner never loops back the ipv4 source-specific-multicast datagram
+          # (TestPacketConnReadWriteMulticastUDP hangs to the 10m timeout) and
+          # ipv6 multicast sends fail with "network is unreachable", so the
+          # multicast-over-loopback tests skip with "no available interface".
+          # nettest.RoutedInterface("ip6", ...) ignores ::1, so give lo a
+          # non-loopback (ULA) IPv6 address as well.
+          sudo ip -6 addr add fd00:5ea1::1/128 dev lo
+          ip addr show dev lo
+          ip route show
+          ip -6 route show
+
+      - name: Test
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            pass=$(awk '/^--- PASS/{n++} END{print n+0}' "$RUNNER_TEMP/full.log")
+            fail=$(awk '/^--- FAIL/{n++} END{print n+0}' "$RUNNER_TEMP/full.log")
+            skip=$(awk '/^--- SKIP/{n++} END{print n+0}' "$RUNNER_TEMP/full.log")
+            echo "TEST SUMMARY: ${pass} passed, ${fail} failed, ${skip} skipped"
+            # go test -v streams each t.Skip message just before the test's
+            # "--- SKIP" line; print every skipped test with its reason.
+            echo "Skipped tests and reasons:"
+            echo "  (note: 'no available interface' = no multicast-capable loopback on the hosted runner; enabling multicast on lo hangs the SSM test there."
+            echo "   'not supported on linux/amd64' = raw sockets need root; the suite runs unprivileged, as the go test default."
+            echo "   'avoid external network'/'skipping external network test' = test is opt-in via its own -diag/-extnet flag.)"
+            awk '
+              /^[[:space:]]*=== RUN/ { cur = $3; reasons[cur] = ""; next }
+              /^[[:space:]]*=== (PAUSE|CONT|NAME)/ { cur = $3; next }
+              /^[[:space:]]*--- SKIP: / {
+                name = $3
+                sub(/^[[:space:]]+/, "")
+                print "SKIPPED: " $0
+                if (reasons[name] == "") print "    reason: (no message of its own; all of its subtests skipped, see their reasons)"
+                else printf "%s", reasons[name]
+                delete reasons[name]
+                next
+              }
+              /^[[:space:]]+[A-Za-z0-9_]+\.go:[0-9]+:/ { line = $0; sub(/^[[:space:]]+/, "", line); reasons[cur] = reasons[cur] "    reason: " line "\n" }
+            ' "$RUNNER_TEMP/full.log"
+          fi
+
+      - name: Upload module zip
+        if: matrix.go == '1.24.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
